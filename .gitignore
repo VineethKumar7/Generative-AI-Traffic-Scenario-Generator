@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Node
+node_modules/
+dist/
+
+# Logs & PIDs
+*.log
+*.pid
+.pids/
+logs/
+
+# IDE
+.vscode/
+.idea/
+
+# Generated scenarios (keep structure, ignore files)
+scenarios/*.xosc
+
+# OS
+.DS_Store
+Thumbs.db

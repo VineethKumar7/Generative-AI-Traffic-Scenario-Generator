@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""
+FastAPI Backend for Scenario Generator
+
+Connects the React frontend to the scenario generation engine.
+"""
+
+import os
+import json
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+
+from scenario_generator import (
+    ScenarioConfig, Vehicle, Pedestrian,
+    WeatherType, TimeOfDay, TrafficDensity, EdgeCaseType,
+    OpenScenarioGenerator
+)
+from ai_generator import AIScenarioGenerator, generate_llm_scenario_description
+
+app = FastAPI(
+    title="Scenario Generator API",
+    description="Generate OpenSCENARIO files for ADAS testing",
+    version="1.0.0"
+)
+
+# CORS for React frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://localhost:8080", "http://192.168.178.34:8080"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Output directory
+SCENARIOS_DIR = Path(__file__).parent / "scenarios"
+SCENARIOS_DIR.mkdir(exist_ok=True)
+
+# Initialize generators
+generator = OpenScenarioGenerator(SCENARIOS_DIR)
+ai_generator = AIScenarioGenerator(str(SCENARIOS_DIR))
+
+
+# ============ Request/Response Models ============
+
+class GenerateRequest(BaseModel):
+    """Request to generate a single scenario."""
+    weather: str = "clear"
+    time_of_day: str = "noon"
+    road_type: str = "urban"
+    edge_case: str = "none"
+    traffic_density: int = 50  # 0-100
+    ego_speed: int = 60  # km/h
+    name: Optional[str] = None
+
+
+class AIGenerateRequest(BaseModel):
+    """Request to generate from natural language."""
+    prompt: str
+
+
+class BatchGenerateRequest(BaseModel):
+    """Request to generate multiple scenarios."""
+    count: int = 10
+    template: Optional[str] = None
+    include_all_weather: bool = False
+    include_all_times: bool = False
+    include_all_edge_cases: bool = False
+
+
+class ScenarioResponse(BaseModel):
+    """Response with generated scenario info."""
+    id: str
+    filename: str
+    path: str
+    weather: str
+    time_of_day: str
+    edge_case: str
+    ego_speed: int
+    created_at: str
+    valid: bool = True
+
+
+class ScenarioListResponse(BaseModel):
+    """List of scenarios."""
+    scenarios: List[ScenarioResponse]
+    total: int
+
+
+class StatsResponse(BaseModel):
+    """Dashboard statistics."""
+    total_scenarios: int
+    scenarios_today: int
+    weather_coverage: dict
+    edge_case_coverage: dict
+
+
+# ============ Helper Functions ============
+
+def map_weather(weather: str) -> WeatherType:
+    mapping = {
+        "clear": WeatherType.CLEAR,
+        "cloudy": WeatherType.CLOUDY,
+        "rainy": WeatherType.RAINY,
+        "foggy": WeatherType.FOGGY,
+        "snowy": WeatherType.SNOWY,
+    }
+    return mapping.get(weather.lower(), WeatherType.CLEAR)
+
+
+def map_time(time: str) -> TimeOfDay:
+    mapping = {
+        "dawn": TimeOfDay.DAWN,
+        "morning": TimeOfDay.MORNING,
+        "noon": TimeOfDay.NOON,
+        "afternoon": TimeOfDay.AFTERNOON,
+        "evening": TimeOfDay.EVENING,
+        "night": TimeOfDay.NIGHT,
+    }
+    return mapping.get(time.lower(), TimeOfDay.NOON)
+
+
+def map_traffic(density: int) -> TrafficDensity:
+    if density < 10:
+        return TrafficDensity.EMPTY
+    elif density < 30:
+        return TrafficDensity.SPARSE
+    elif density < 60:
+        return TrafficDensity.MODERATE
+    elif density < 85:
+        return TrafficDensity.DENSE
+    else:
+        return TrafficDensity.RUSH_HOUR
+
+
+def map_edge_case(edge_case: str) -> EdgeCaseType:
+    mapping = {
+        "none": EdgeCaseType.NONE,
+        "pedestrian": EdgeCaseType.PEDESTRIAN_CROSSING,
+        "cutin": EdgeCaseType.CUT_IN,
+        "cutout": EdgeCaseType.CUT_OUT,
+        "ebrake": EdgeCaseType.EMERGENCY_BRAKE,
+        "lanechange": EdgeCaseType.LANE_CHANGE,
+        "cyclist": EdgeCaseType.CYCLIST,
+        "animal": EdgeCaseType.ANIMAL_CROSSING,
+        "intersection": EdgeCaseType.INTERSECTION,
+    }
+    return mapping.get(edge_case.lower(), EdgeCaseType.NONE)
+
+
+def map_road_to_network(road_type: str) -> str:
+    mapping = {
+        "highway": "Town04",
+        "urban": "Town01",
+        "rural": "Town02",
+    }
+    return mapping.get(road_type.lower(), "Town01")
+
+
+def get_scenario_metadata(filepath: Path) -> dict:
+    """Extract metadata from scenario file."""
+    # Parse basic info from filename and content
+    filename = filepath.name
+    stat = filepath.stat()
+    
+    # Try to extract info from filename pattern: scenario_{template}_{weather}_{time}_{id}.xosc
+    parts = filename.replace(".xosc", "").split("_")
+    
+    return {
+        "id": filepath.stem,
+        "filename": filename,
+        "path": str(filepath),
+        "weather": parts[2] if len(parts) > 2 else "unknown",
+        "time_of_day": parts[3] if len(parts) > 3 else "unknown",
+        "edge_case": "unknown",
+        "ego_speed": 60,
+        "created_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+        "valid": True,
+    }
+
+
+# ============ API Endpoints ============
+
+@app.get("/")
+def root():
+    """Health check."""
+    return {"status": "ok", "service": "Scenario Generator API"}
+
+
+@app.get("/api/stats", response_model=StatsResponse)
+def get_stats():
+    """Get dashboard statistics."""
+    scenarios = list(SCENARIOS_DIR.glob("*.xosc"))
+    today = datetime.now().date()
+    
+    scenarios_today = sum(
+        1 for s in scenarios 
+        if datetime.fromtimestamp(s.stat().st_mtime).date() == today
+    )
+    
+    # Count weather types from filenames
+    weather_counts = {}
+    edge_counts = {}
+    
+    for s in scenarios:
+        parts = s.stem.split("_")
+        if len(parts) > 2:
+            w = parts[2]
+            weather_counts[w] = weather_counts.get(w, 0) + 1
+    
+    return StatsResponse(
+        total_scenarios=len(scenarios),
+        scenarios_today=scenarios_today,
+        weather_coverage=weather_counts,
+        edge_case_coverage=edge_counts,
+    )
+
+
+@app.post("/api/generate", response_model=ScenarioResponse)
+def generate_scenario(request: GenerateRequest):
+    """Generate a single scenario from parameters."""
+    try:
+        # Map parameters
+        weather = map_weather(request.weather)
+        time_of_day = map_time(request.time_of_day)
+        traffic = map_traffic(request.traffic_density)
+        edge_case = map_edge_case(request.edge_case)
+        road_network = map_road_to_network(request.road_type)
+        
+        # Generate vehicles based on traffic
+        vehicles = []
+        vehicle_count = request.traffic_density // 20  # 0-5 vehicles
+        for i in range(vehicle_count):
+            vehicles.append(Vehicle(
+                name=f"NPC_{i+1}",
+                initial_speed=float(request.ego_speed - 10 + (i * 5)),
+                lane=i % 2,
+                s_position=30.0 + (i * 25),
+            ))
+        
+        # Add pedestrian for pedestrian edge case
+        pedestrians = []
+        if edge_case == EdgeCaseType.PEDESTRIAN_CROSSING:
+            pedestrians.append(Pedestrian(
+                name="Pedestrian_1",
+                s_position=60.0,
+                lateral_offset=4.0,
+                crossing=True,
+            ))
+        
+        # Build scenario name
+        name = request.name or f"{request.road_type}_{request.weather}_{request.edge_case}"
+        
+        # Create config
+        config = ScenarioConfig(
+            name=name,
+            description=f"Generated scenario: {weather.value}, {time_of_day.value}, {edge_case.value}",
+            road_network=road_network,
+            weather=weather,
+            time_of_day=time_of_day,
+            traffic_density=traffic,
+            edge_case=edge_case,
+            ego_speed=float(request.ego_speed),
+            duration=30.0,
+            vehicles=vehicles,
+            pedestrians=pedestrians,
+        )
+        
+        # Generate
+        output_path = generator.generate(config)
+        
+        return ScenarioResponse(
+            id=Path(output_path).stem,
+            filename=Path(output_path).name,
+            path=str(output_path),
+            weather=request.weather,
+            time_of_day=request.time_of_day,
+            edge_case=request.edge_case,
+            ego_speed=request.ego_speed,
+            created_at=datetime.now().isoformat(),
+            valid=True,
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/generate/ai", response_model=ScenarioResponse)
+def generate_from_prompt(request: AIGenerateRequest):
+    """Generate scenario from natural language description."""
+    try:
+        # Parse prompt
+        params = generate_llm_scenario_description(request.prompt)
+        
+        # Generate scenario
+        path = ai_generator.generate_scenario(
+            weather=params.get("weather"),
+            time_of_day=params.get("time_of_day"),
+            edge_case=params.get("edge_case"),
+            custom_name="ai_generated",
+        )
+        
+        return ScenarioResponse(
+            id=Path(path).stem,
+            filename=Path(path).name,
+            path=path,
+            weather=params.get("weather", WeatherType.CLEAR).value,
+            time_of_day=params.get("time_of_day", TimeOfDay.NOON).value,
+            edge_case=params.get("edge_case", EdgeCaseType.NONE).value,
+            ego_speed=params.get("ego_speed", 60),
+            created_at=datetime.now().isoformat(),
+            valid=True,
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/generate/batch")
+def generate_batch(request: BatchGenerateRequest):
+    """Generate multiple scenarios."""
+    try:
+        paths = ai_generator.generate_batch(
+            count=request.count,
+            template_name=request.template,
+            include_all_weather=request.include_all_weather,
+            include_all_times=request.include_all_times,
+            include_all_edge_cases=request.include_all_edge_cases,
+        )
+        
+        scenarios = []
+        for path in paths:
+            meta = get_scenario_metadata(Path(path))
+            scenarios.append(ScenarioResponse(**meta))
+        
+        return {
+            "generated": len(paths),
+            "scenarios": scenarios,
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/scenarios", response_model=ScenarioListResponse)
+def list_scenarios(limit: int = 50, offset: int = 0):
+    """List all generated scenarios."""
+    all_files = sorted(
+        SCENARIOS_DIR.glob("*.xosc"),
+        key=lambda x: x.stat().st_mtime,
+        reverse=True
+    )
+    
+    scenarios = []
+    for filepath in all_files[offset:offset + limit]:
+        meta = get_scenario_metadata(filepath)
+        scenarios.append(ScenarioResponse(**meta))
+    
+    return ScenarioListResponse(
+        scenarios=scenarios,
+        total=len(all_files),
+    )
+
+
+@app.get("/api/scenarios/{scenario_id}")
+def get_scenario(scenario_id: str):
+    """Get scenario details and content."""
+    filepath = SCENARIOS_DIR / f"{scenario_id}.xosc"
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Scenario not found")
+    
+    meta = get_scenario_metadata(filepath)
+    content = filepath.read_text()
+    
+    return {
+        **meta,
+        "content": content,
+    }
+
+
+@app.get("/api/scenarios/{scenario_id}/download")
+def download_scenario(scenario_id: str):
+    """Download scenario file."""
+    filepath = SCENARIOS_DIR / f"{scenario_id}.xosc"
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Scenario not found")
+    
+    return FileResponse(
+        filepath,
+        media_type="application/xml",
+        filename=filepath.name,
+    )
+
+
+@app.delete("/api/scenarios/{scenario_id}")
+def delete_scenario(scenario_id: str):
+    """Delete a scenario."""
+    filepath = SCENARIOS_DIR / f"{scenario_id}.xosc"
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Scenario not found")
+    
+    filepath.unlink()
+    return {"deleted": scenario_id}
+
+
+@app.get("/api/templates")
+def list_templates():
+    """List available scenario templates."""
+    from ai_generator import SCENARIO_TEMPLATES
+    return {
+        "templates": [
+            {
+                "id": name,
+                "description": t["description"],
+                "road_network": t["road_network"],
+                "speed_range": t["ego_speed_range"],
+            }
+            for name, t in SCENARIO_TEMPLATES.items()
+        ]
+    }
+
+
+@app.get("/api/options")
+def list_options():
+    """List all available options for generation."""
+    return {
+        "weather": [w.value for w in WeatherType],
+        "time_of_day": [t.value for t in TimeOfDay],
+        "traffic_density": [d.value for d in TrafficDensity],
+        "edge_cases": [e.value for e in EdgeCaseType],
+    }
+
+
+# ============ CARLA Integration ============
+
+from carla_integration.runner import CarlaScenarioRunner, CARLA_AVAILABLE
+
+# Global CARLA runner instance
+carla_runner: Optional[CarlaScenarioRunner] = None
+carla_connected = False
+
+
+@app.get("/api/carla/status")
+def get_carla_status():
+    """Check CARLA server status."""
+    global carla_runner, carla_connected
+    
+    # Try to check if CARLA is available
+    available = False
+    if CARLA_AVAILABLE:
+        try:
+            import carla
+            test_client = carla.Client("localhost", 2000)
+            test_client.set_timeout(2.0)
+            test_client.get_server_version()
+            available = True
+        except:
+            available = False
+    
+    return {
+        "available": available,
+        "connected": carla_connected,
+        "host": "localhost",
+        "port": 2000,
+        "carla_package": CARLA_AVAILABLE,
+    }
+
+
+@app.post("/api/carla/connect")
+def connect_carla():
+    """Connect to CARLA server."""
+    global carla_runner, carla_connected
+    
+    if not CARLA_AVAILABLE:
+        # Mock mode for development
+        carla_runner = CarlaScenarioRunner()
+        carla_connected = True
+        return {
+            "connected": True,
+            "message": "Connected in mock mode (CARLA package not installed)",
+        }
+    
+    try:
+        carla_runner = CarlaScenarioRunner(host="localhost", port=2000)
+        if carla_runner.connect():
+            carla_connected = True
+            return {
+                "connected": True,
+                "message": "Connected to CARLA server at localhost:2000",
+            }
+        else:
+            raise HTTPException(status_code=503, detail="Failed to connect to CARLA server")
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.post("/api/carla/disconnect")
+def disconnect_carla():
+    """Disconnect from CARLA server."""
+    global carla_runner, carla_connected
+    
+    carla_runner = None
+    carla_connected = False
+    
+    return {
+        "connected": False,
+        "message": "Disconnected from CARLA",
+    }
+
+
+@app.post("/api/carla/run/{scenario_id}")
+def run_scenario_in_carla(scenario_id: str):
+    """Run a scenario in CARLA."""
+    global carla_runner, carla_connected
+    
+    if not carla_connected or carla_runner is None:
+        raise HTTPException(status_code=400, detail="Not connected to CARLA")
+    
+    filepath = SCENARIOS_DIR / f"{scenario_id}.xosc"
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Scenario not found")
+    
+    # Run scenario (this will be async in future)
+    result = carla_runner.run_scenario(str(filepath))
+    
+    return {
+        "started": True,
+        "scenario_id": scenario_id,
+        "message": f"Running {filepath.name}",
+        "result": {
+            "success": result.success,
+            "duration": result.duration_seconds,
+            "collisions": result.collision_count,
+            "error": result.error_message,
+        }
+    }
+
+
+@app.post("/api/carla/stop")
+def stop_carla_scenario():
+    """Stop current running scenario."""
+    global carla_runner
+    
+    # In future: implement actual stop logic
+    return {
+        "stopped": True,
+        "message": "Scenario stopped",
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
