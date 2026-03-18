@@ -244,3 +244,176 @@ class MultiCameraStreamer:
         """Set the active camera view."""
         if name in self.cameras:
             self.active_camera = name
+
+
+class SpectatorStreamer:
+    """
+    Streams from CARLA's spectator camera (no vehicle needed).
+    Used for preview mode to show live world view.
+    """
+    
+    def __init__(
+        self,
+        world: 'carla.World',
+        width: int = 800,
+        height: int = 600,
+        fov: int = 90,
+    ):
+        self.world = world
+        self.width = width
+        self.height = height
+        self.fov = fov
+        
+        self.camera: Optional['carla.Sensor'] = None
+        self.latest_frame: Optional[bytes] = None
+        self.frame_lock = threading.Lock()
+        self.running = False
+        
+    def _get_spawn_point_center(self) -> 'carla.Transform':
+        """Get a good camera position based on map spawn points."""
+        try:
+            spawn_points = self.world.get_map().get_spawn_points()
+            if spawn_points:
+                # Use first spawn point as reference, elevated for overview
+                sp = spawn_points[0]
+                return carla.Transform(
+                    carla.Location(x=sp.location.x, y=sp.location.y, z=50),
+                    carla.Rotation(pitch=-60, yaw=sp.rotation.yaw)
+                )
+        except:
+            pass
+        # Fallback
+        return carla.Transform(
+            carla.Location(x=0, y=0, z=50),
+            carla.Rotation(pitch=-60)
+        )
+    
+    def _get_street_view(self) -> 'carla.Transform':
+        """Get a street-level camera position."""
+        try:
+            spawn_points = self.world.get_map().get_spawn_points()
+            if spawn_points:
+                # Use first spawn point for street view
+                sp = spawn_points[0]
+                return carla.Transform(
+                    carla.Location(x=sp.location.x - 10, y=sp.location.y, z=5),
+                    carla.Rotation(pitch=-15, yaw=sp.rotation.yaw)
+                )
+        except:
+            pass
+        # Fallback
+        return carla.Transform(
+            carla.Location(x=0, y=0, z=5),
+            carla.Rotation(pitch=-15)
+        )
+    
+    def start(self, location: str = 'overview') -> bool:
+        """Start spectator camera at a predefined location."""
+        if not CARLA_AVAILABLE:
+            print("CARLA not available")
+            return False
+            
+        try:
+            # Get camera blueprint
+            blueprint_library = self.world.get_blueprint_library()
+            camera_bp = blueprint_library.find('sensor.camera.rgb')
+            
+            # Set camera attributes
+            camera_bp.set_attribute('image_size_x', str(self.width))
+            camera_bp.set_attribute('image_size_y', str(self.height))
+            camera_bp.set_attribute('fov', str(self.fov))
+            
+            # Get spectator transform or use predefined locations
+            if location == 'spectator':
+                transform = self.world.get_spectator().get_transform()
+            elif location == 'overview':
+                # Bird's eye overview centered on spawn points
+                transform = self._get_spawn_point_center()
+            elif location == 'street':
+                # Street level view near spawn
+                transform = self._get_street_view()
+            else:
+                transform = self.world.get_spectator().get_transform()
+            
+            self._current_location = location
+            
+            # Spawn camera in world (not attached to vehicle)
+            self.camera = self.world.spawn_actor(camera_bp, transform)
+            
+            # Register callback for frames
+            self.running = True
+            self.camera.listen(self._process_frame)
+            
+            print(f"Spectator camera started: {self.width}x{self.height} @ {location}")
+            return True
+            
+        except Exception as e:
+            print(f"Failed to start spectator camera: {e}")
+            return False
+    
+    def _process_frame(self, image: 'carla.Image'):
+        """Process incoming camera frame."""
+        if not self.running:
+            return
+            
+        try:
+            # Convert CARLA image to numpy array
+            array = np.frombuffer(image.raw_data, dtype=np.uint8)
+            array = array.reshape((self.height, self.width, 4))  # BGRA
+            array = array[:, :, :3]  # Remove alpha -> BGR
+            array = array[:, :, ::-1]  # BGR -> RGB
+            
+            # Convert to JPEG
+            if PIL_AVAILABLE:
+                pil_image = Image.fromarray(array)
+                buffer = io.BytesIO()
+                pil_image.save(buffer, format='JPEG', quality=70)
+                jpeg_bytes = buffer.getvalue()
+            else:
+                jpeg_bytes = array.tobytes()
+            
+            # Store latest frame
+            with self.frame_lock:
+                self.latest_frame = jpeg_bytes
+                
+        except Exception as e:
+            print(f"Spectator frame processing error: {e}")
+    
+    def get_frame_base64(self) -> Optional[str]:
+        """Get the latest frame as base64-encoded JPEG string."""
+        with self.frame_lock:
+            if self.latest_frame:
+                return base64.b64encode(self.latest_frame).decode('utf-8')
+        return None
+    
+    def set_location(self, location: str):
+        """Move camera to a different location."""
+        if not self.camera:
+            return
+        
+        if location == 'spectator':
+            transform = self.world.get_spectator().get_transform()
+        elif location == 'overview':
+            transform = self._get_spawn_point_center()
+        elif location == 'street':
+            transform = self._get_street_view()
+        else:
+            return
+        
+        self._current_location = location
+        self.camera.set_transform(transform)
+    
+    def stop(self):
+        """Stop the camera and cleanup."""
+        self.running = False
+        
+        if self.camera:
+            try:
+                self.camera.stop()
+                self.camera.destroy()
+            except:
+                pass
+            self.camera = None
+            
+        self.latest_frame = None
+        print("Spectator camera stopped")

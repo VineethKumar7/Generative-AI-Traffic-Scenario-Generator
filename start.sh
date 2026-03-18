@@ -78,8 +78,11 @@ if [ "$START_CARLA" = true ]; then
             rm -f .pids/carla.pid
         fi
         
-        # Start CARLA in background
-        nohup "$CARLA_ROOT/CarlaUE4.sh" -RenderOffScreen -quality-level=Low > logs/carla.log 2>&1 &
+        # Start CARLA in background (force NVIDIA GPU on hybrid laptops)
+        export __NV_PRIME_RENDER_OFFLOAD=1
+        export __GLX_VENDOR_LIBRARY_NAME=nvidia
+        export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
+        nohup "$CARLA_ROOT/CarlaUE4.sh" -RenderOffScreen -quality-level=Low -prefernvidia > logs/carla.log 2>&1 &
         echo $! > .pids/carla.pid
         echo -e "      CARLA started (PID: $(cat .pids/carla.pid))"
         echo -e "      → localhost:2000"

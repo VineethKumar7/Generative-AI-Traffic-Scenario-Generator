@@ -68,6 +68,7 @@ class CarlaScenarioRunner:
         self.timeout = timeout
         self.client = None
         self.world = None
+        self.ego_vehicle = None  # Current ego vehicle (for camera attachment)
         
     def connect(self) -> bool:
         """Connect to CARLA simulator."""
@@ -77,7 +78,7 @@ class CarlaScenarioRunner:
             
         try:
             self.client = carla.Client(self.host, self.port)
-            self.client.set_timeout(10.0)
+            self.client.set_timeout(30.0)  # Increased timeout for stability
             self.world = self.client.get_world()
             print(f"Connected to CARLA at {self.host}:{self.port}")
             return True
@@ -171,12 +172,28 @@ class CarlaScenarioRunner:
         # to parse the OpenSCENARIO file and execute actions
         
         start_time = time.time()
+        vehicle = None
         
         try:
-            # Load the appropriate map
+            # Load the appropriate map (only if different from current)
             # In full implementation, read from scenario file
-            self.client.load_world("Town01")
-            time.sleep(2)  # Wait for world to load
+            current_map = self.world.get_map().name
+            target_map = "Town01"
+            
+            if target_map not in current_map:
+                print(f"Loading map {target_map} (current: {current_map})")
+                self.client.load_world(target_map)
+                time.sleep(5)  # Wait for world to load
+                # IMPORTANT: Get fresh world reference after load_world
+                self.world = self.client.get_world()
+            else:
+                print(f"Already on {target_map}, skipping load_world")
+            
+            # Set synchronous mode OFF for autopilot to work properly
+            settings = self.world.get_settings()
+            settings.synchronous_mode = False
+            settings.fixed_delta_seconds = None
+            self.world.apply_settings(settings)
             
             # Set up spectator for viewing
             spectator = self.world.get_spectator()
@@ -189,27 +206,86 @@ class CarlaScenarioRunner:
             if spawn_points:
                 spawn_point = spawn_points[0]
                 vehicle = self.world.spawn_actor(vehicle_bp, spawn_point)
+                self.ego_vehicle = vehicle  # Store reference for camera attachment
                 
-                # Enable autopilot for basic testing
-                vehicle.set_autopilot(True)
+                # Move spectator to follow vehicle initially
+                vehicle_transform = vehicle.get_transform()
+                spectator_transform = carla.Transform(
+                    vehicle_transform.location + carla.Location(x=-10, z=5),
+                    carla.Rotation(pitch=-20, yaw=vehicle_transform.rotation.yaw)
+                )
+                spectator.set_transform(spectator_transform)
                 
-                # Run for scenario duration
+                # Set up Traffic Manager for autopilot (use port 8100 to avoid conflict with API on 8000)
+                try:
+                    traffic_manager = self.client.get_trafficmanager(8100)
+                    traffic_manager.set_synchronous_mode(False)
+                    
+                    # Enable autopilot with traffic manager
+                    vehicle.set_autopilot(True, traffic_manager.get_port())
+                    
+                    # Configure driving behavior
+                    traffic_manager.ignore_lights_percentage(vehicle, 0)  # Obey traffic lights
+                    traffic_manager.distance_to_leading_vehicle(vehicle, 2.0)
+                    traffic_manager.vehicle_percentage_speed_difference(vehicle, -20)  # 20% faster
+                    
+                    print(f"Vehicle spawned with Traffic Manager autopilot at {spawn_point.location}")
+                except Exception as tm_error:
+                    print(f"Traffic Manager failed: {tm_error}, using simple autopilot")
+                    # Fallback: simple autopilot without traffic manager
+                    vehicle.set_autopilot(True)
+                
+                # Run for scenario duration, collecting metrics
                 duration = 30  # Default duration
-                time.sleep(duration)
+                collision_count = 0
+                max_speed = 0
+                total_speed = 0
+                samples = 0
                 
-                # Collect basic metrics
-                velocity = vehicle.get_velocity()
-                speed = (velocity.x**2 + velocity.y**2 + velocity.z**2)**0.5
+                # Set up collision sensor
+                collision_bp = blueprint_library.find('sensor.other.collision')
+                collision_sensor = self.world.spawn_actor(collision_bp, carla.Transform(), attach_to=vehicle)
                 
-                # Cleanup
+                def on_collision(event):
+                    nonlocal collision_count
+                    collision_count += 1
+                    print(f"Collision detected with {event.other_actor.type_id}")
+                    
+                collision_sensor.listen(on_collision)
+                
+                # Run simulation
+                end_time = time.time() + duration
+                while time.time() < end_time:
+                    velocity = vehicle.get_velocity()
+                    speed = (velocity.x**2 + velocity.y**2 + velocity.z**2)**0.5 * 3.6  # km/h
+                    total_speed += speed
+                    max_speed = max(max_speed, speed)
+                    samples += 1
+                    time.sleep(0.1)  # 10 Hz sampling
+                
+                # Calculate final metrics
+                avg_speed = total_speed / samples if samples > 0 else 0
+                
+                # Cleanup sensors
+                collision_sensor.stop()
+                collision_sensor.destroy()
+                
+                # Cleanup vehicle
                 vehicle.destroy()
+                vehicle = None
                 
                 return ScenarioResult(
                     scenario_file=str(scenario_path),
-                    success=True,
+                    success=collision_count == 0,
                     duration_seconds=time.time() - start_time,
-                    average_speed=speed * 3.6,  # Convert to km/h
-                    metrics={"note": "Basic execution - full metrics require ScenarioRunner"},
+                    collision_count=collision_count,
+                    average_speed=avg_speed,
+                    metrics={
+                        "max_speed_kmh": max_speed,
+                        "avg_speed_kmh": avg_speed,
+                        "samples": samples,
+                        "note": "Basic execution with autopilot",
+                    },
                 )
             else:
                 return ScenarioResult(
@@ -220,6 +296,12 @@ class CarlaScenarioRunner:
                 )
                 
         except Exception as e:
+            # Cleanup on error
+            if vehicle is not None:
+                try:
+                    vehicle.destroy()
+                except:
+                    pass
             return ScenarioResult(
                 scenario_file=str(scenario_path),
                 success=False,

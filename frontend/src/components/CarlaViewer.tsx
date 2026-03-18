@@ -53,6 +53,12 @@ const CAMERA_OPTIONS = [
 const API_BASE = "http://localhost:8000";
 const WS_BASE = "ws://localhost:8000";
 
+const SPECTATOR_LOCATIONS = [
+  { id: "overview", label: "Overview", icon: "🗺️" },
+  { id: "street", label: "Street Level", icon: "🚗" },
+  { id: "spectator", label: "Free Camera", icon: "📷" },
+];
+
 export function CarlaViewer({
   scenarioName = "scenario_rainy_night.xosc",
   isConnected,
@@ -63,13 +69,16 @@ export function CarlaViewer({
   onRestart,
 }: CarlaViewerProps) {
   const [camera, setCamera] = useState("chase");
+  const [spectatorLocation, setSpectatorLocation] = useState("overview");
   const [isPaused, setIsPaused] = useState(false);
   const [progress, setProgress] = useState(0);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [useRealStream, setUseRealStream] = useState(true); // Default ON
   const [streamConnected, setStreamConnected] = useState(false);
   const [currentFrame, setCurrentFrame] = useState<string | null>(null);
+  const [spectatorActive, setSpectatorActive] = useState(false);
   const framePollingRef = useRef<NodeJS.Timeout | null>(null);
+  const spectatorPollingRef = useRef<NodeJS.Timeout | null>(null);
   const [metrics, setMetrics] = useState<Metrics>({
     speed: 0,
     ttc: 999,
@@ -164,6 +173,110 @@ export function CarlaViewer({
     }
   }, [useRealStream, streamConnected]);
 
+  // ============ Spectator Camera (Preview Mode) ============
+  
+  // Start spectator camera for preview
+  const startSpectator = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/carla/spectator/start?location=${spectatorLocation}`, {
+        method: "POST",
+      });
+      if (!res.ok) throw new Error("Failed to start spectator camera");
+      setSpectatorActive(true);
+      return true;
+    } catch (error) {
+      console.error("Spectator start error:", error);
+      return false;
+    }
+  }, [spectatorLocation]);
+
+  // Stop spectator camera
+  const stopSpectator = useCallback(async () => {
+    if (spectatorPollingRef.current) {
+      clearInterval(spectatorPollingRef.current);
+      spectatorPollingRef.current = null;
+    }
+    
+    try {
+      await fetch(`${API_BASE}/api/carla/spectator/stop`, { method: "POST" });
+    } catch {
+      // Ignore errors
+    }
+    
+    setSpectatorActive(false);
+  }, []);
+
+  // Change spectator location
+  const handleSpectatorLocationChange = useCallback(async (newLocation: string) => {
+    setSpectatorLocation(newLocation);
+    if (spectatorActive) {
+      try {
+        await fetch(`${API_BASE}/api/carla/spectator/location/${newLocation}`, {
+          method: "POST",
+        });
+      } catch {
+        // Ignore
+      }
+    }
+  }, [spectatorActive]);
+
+  // Start spectator when connected but not running (preview mode)
+  useEffect(() => {
+    if (!isConnected || isRunning || !useRealStream) {
+      // Stop spectator if running
+      if (spectatorActive) {
+        stopSpectator();
+      }
+      return;
+    }
+
+    // Start spectator camera for preview
+    startSpectator();
+
+    return () => {
+      stopSpectator();
+    };
+  }, [isConnected, isRunning, useRealStream]);
+
+  // Poll spectator frames when in preview mode
+  useEffect(() => {
+    if (!spectatorActive || isRunning || !useRealStream || !isConnected) {
+      if (spectatorPollingRef.current) {
+        clearInterval(spectatorPollingRef.current);
+        spectatorPollingRef.current = null;
+      }
+      return;
+    }
+
+    // Poll for spectator frames at ~15 FPS
+    const pollSpectatorFrames = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/carla/spectator/frame`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.frame && data.status === "ok") {
+            setCurrentFrame(`data:image/jpeg;base64,${data.frame}`);
+            setStreamConnected(true);
+          } else if (data.status === "spectator_not_started" || data.status === "no_frame_yet") {
+            setStreamConnected(false);
+          }
+        }
+      } catch {
+        setStreamConnected(false);
+      }
+    };
+
+    pollSpectatorFrames(); // Initial fetch
+    spectatorPollingRef.current = setInterval(pollSpectatorFrames, 66); // ~15 FPS
+
+    return () => {
+      if (spectatorPollingRef.current) {
+        clearInterval(spectatorPollingRef.current);
+        spectatorPollingRef.current = null;
+      }
+    };
+  }, [spectatorActive, isRunning, useRealStream, isConnected]);
+
   // Cleanup on unmount
   useEffect(() => {
     return () => {
@@ -172,6 +285,9 @@ export function CarlaViewer({
       }
       if (framePollingRef.current) {
         clearInterval(framePollingRef.current);
+      }
+      if (spectatorPollingRef.current) {
+        clearInterval(spectatorPollingRef.current);
       }
     };
   }, []);
@@ -371,11 +487,14 @@ export function CarlaViewer({
             alt="CARLA Stream"
             className="w-full h-full object-cover"
           />
-        ) : useRealStream && !currentFrame ? (
-          <div className="w-full h-full flex items-center justify-center text-white">
+        ) : useRealStream && isConnected && !currentFrame ? (
+          <div className="w-full h-full flex items-center justify-center text-white bg-gray-900">
             <div className="text-center">
               <div className="animate-spin text-4xl mb-2">⏳</div>
-              <p>Waiting for camera stream...</p>
+              <p>{isRunning ? "Waiting for scenario camera..." : "Starting CARLA preview..."}</p>
+              <p className="text-gray-400 text-sm mt-2">
+                {spectatorActive ? "Spectator camera active" : "Initializing..."}
+              </p>
             </div>
           </div>
         ) : (
@@ -388,16 +507,30 @@ export function CarlaViewer({
           />
         )}
 
-        {/* Overlay - Live Badge */}
-        {isRunning && (
+        {/* Overlay - Live/Preview Badge */}
+        {(isRunning || (spectatorActive && streamConnected)) && (
           <div className="absolute top-4 left-4 flex items-center gap-2">
-            <Badge variant="destructive" className="animate-pulse">
-              🔴 LIVE
-            </Badge>
-            <Badge variant="secondary" className="bg-black/50 text-white">
-              {camera === "bird" ? "🦅" : camera === "chase" ? "🚗" : "👁️"}{" "}
-              {CAMERA_OPTIONS.find((c) => c.id === camera)?.label}
-            </Badge>
+            {isRunning ? (
+              <>
+                <Badge variant="destructive" className="animate-pulse">
+                  🔴 LIVE
+                </Badge>
+                <Badge variant="secondary" className="bg-black/50 text-white">
+                  {camera === "bird" ? "🦅" : camera === "chase" ? "🚗" : "👁️"}{" "}
+                  {CAMERA_OPTIONS.find((c) => c.id === camera)?.label}
+                </Badge>
+              </>
+            ) : (
+              <>
+                <Badge variant="secondary" className="bg-blue-600 text-white">
+                  👁️ PREVIEW
+                </Badge>
+                <Badge variant="secondary" className="bg-black/50 text-white">
+                  {SPECTATOR_LOCATIONS.find((l) => l.id === spectatorLocation)?.icon}{" "}
+                  {SPECTATOR_LOCATIONS.find((l) => l.id === spectatorLocation)?.label}
+                </Badge>
+              </>
+            )}
             {useRealStream && (
               <Badge variant={streamConnected ? "default" : "secondary"} className="bg-green-600 text-white">
                 {streamConnected ? "📡 Real Stream" : "📡 Connecting..."}
@@ -498,20 +631,36 @@ export function CarlaViewer({
                 </Button>
               )}
 
-              {/* Camera selector */}
-              <Select value={camera} onValueChange={handleCameraChange}>
-                <SelectTrigger className="w-36 h-8 bg-white/10 border-white/20 text-white">
-                  <Camera className="h-4 w-4 mr-2" />
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {CAMERA_OPTIONS.map((cam) => (
-                    <SelectItem key={cam.id} value={cam.id}>
-                      {cam.icon} {cam.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              {/* Camera selector - show different options based on running state */}
+              {isRunning ? (
+                <Select value={camera} onValueChange={handleCameraChange}>
+                  <SelectTrigger className="w-36 h-8 bg-white/10 border-white/20 text-white">
+                    <Camera className="h-4 w-4 mr-2" />
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {CAMERA_OPTIONS.map((cam) => (
+                      <SelectItem key={cam.id} value={cam.id}>
+                        {cam.icon} {cam.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <Select value={spectatorLocation} onValueChange={handleSpectatorLocationChange}>
+                  <SelectTrigger className="w-36 h-8 bg-white/10 border-white/20 text-white">
+                    <Camera className="h-4 w-4 mr-2" />
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {SPECTATOR_LOCATIONS.map((loc) => (
+                      <SelectItem key={loc.id} value={loc.id}>
+                        {loc.icon} {loc.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
 
               <Button size="sm" variant="ghost" className="text-white">
                 <Volume2 className="h-4 w-4" />

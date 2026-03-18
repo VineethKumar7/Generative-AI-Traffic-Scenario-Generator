@@ -442,7 +442,7 @@ def list_options():
 # ============ CARLA Integration ============
 
 from carla_integration.runner import CarlaScenarioRunner, CARLA_AVAILABLE
-from carla_integration.camera_streamer import CameraStreamer
+from carla_integration.camera_streamer import CameraStreamer, SpectatorStreamer
 
 # Global CARLA runner instance
 carla_runner: Optional[CarlaScenarioRunner] = None
@@ -552,36 +552,71 @@ def _run_scenario_thread(filepath: str, scenario_id: str):
             scenario_state["running"] = False
             return
         
-        # Start camera streaming with retry
+        # Clear any existing ego vehicle reference
+        carla_runner.ego_vehicle = None
+        
+        # Start scenario in a way that allows camera to attach mid-run
+        # We'll run the scenario in chunks to allow camera attachment
+        import threading
+        
+        scenario_result = [None]  # Use list to allow modification in nested function
+        
+        def run_scenario():
+            scenario_result[0] = carla_runner.run_scenario(filepath)
+        
+        # Start scenario in separate thread
+        scenario_thread = threading.Thread(target=run_scenario)
+        scenario_thread.start()
+        
+        # Poll for ego vehicle and start camera once available
         camera_started = False
-        for attempt in range(5):  # Try 5 times over ~5 seconds
+        for attempt in range(30):  # Try for 30 seconds
             time.sleep(1)
+            
+            # Check if scenario already finished (error case)
+            if not scenario_thread.is_alive() and scenario_result[0] is not None:
+                break
+                
             try:
-                world = carla_runner.world
-                if world is None:
-                    continue
-                vehicles = world.get_actors().filter('vehicle.*')
-                if len(vehicles) > 0:
-                    camera_streamer = CameraStreamer(
-                        world=world,
-                        vehicle=vehicles[0],
-                        width=800,
-                        height=600,
-                        camera_type='chase'
-                    )
-                    camera_streamer.start()
-                    camera_started = True
-                    print(f"Camera started on attempt {attempt + 1}")
-                    break
+                # Check for ego vehicle from runner
+                if carla_runner.ego_vehicle is not None:
+                    world = carla_runner.world
+                    if world is not None:
+                        camera_streamer = CameraStreamer(
+                            world=world,
+                            vehicle=carla_runner.ego_vehicle,
+                            width=800,
+                            height=600,
+                            camera_type='chase'
+                        )
+                        camera_streamer.start()
+                        camera_started = True
+                        print(f"Camera attached to ego vehicle on attempt {attempt + 1}")
+                        break
             except Exception as e:
                 print(f"Camera start attempt {attempt + 1} failed: {e}")
         
         if not camera_started:
             print("Warning: Could not start camera, continuing without streaming")
         
-        # Run the scenario with timeout protection
+        # Wait for scenario to complete
+        scenario_thread.join(timeout=max_runtime)
+        
+        if scenario_thread.is_alive():
+            print("Scenario thread still running after timeout")
+            scenario_state["error"] = f"Scenario timed out after {max_runtime}s"
+            scenario_state["running"] = False
+            return
+        
+        # Get result
+        result = scenario_result[0]
+        if result is None:
+            scenario_state["error"] = "Scenario returned no result"
+            scenario_state["running"] = False
+            return
+            
+        # Process result
         try:
-            result = carla_runner.run_scenario(filepath)
             
             scenario_state["result"] = {
                 "success": result.success,
@@ -600,6 +635,9 @@ def _run_scenario_thread(filepath: str, scenario_id: str):
         scenario_state["error"] = f"Unexpected error: {str(e)}"
     finally:
         scenario_state["running"] = False
+        # Clear ego vehicle reference
+        if carla_runner:
+            carla_runner.ego_vehicle = None
         # Stop camera safely
         if camera_streamer:
             try:
@@ -789,6 +827,88 @@ def set_camera_type(camera_type: str):
     
     camera_streamer.set_camera_type(camera_type)
     return {"camera_type": camera_type}
+
+
+# ============ Spectator Camera (Preview Mode) ============
+
+spectator_streamer: Optional[SpectatorStreamer] = None
+
+
+@app.post("/api/carla/spectator/start")
+def start_spectator_camera(location: str = "overview"):
+    """Start spectator camera for preview (no vehicle needed)."""
+    global spectator_streamer, carla_runner, carla_connected
+    
+    if not carla_connected or carla_runner is None:
+        raise HTTPException(status_code=400, detail="Not connected to CARLA")
+    
+    if not CARLA_AVAILABLE:
+        raise HTTPException(status_code=400, detail="CARLA not available")
+    
+    try:
+        world = carla_runner.world
+        if world is None:
+            raise HTTPException(status_code=400, detail="CARLA world not available")
+        
+        # Stop existing spectator if running
+        if spectator_streamer:
+            spectator_streamer.stop()
+        
+        # Create and start spectator camera
+        spectator_streamer = SpectatorStreamer(
+            world=world,
+            width=800,
+            height=600
+        )
+        
+        if spectator_streamer.start(location=location):
+            return {"started": True, "location": location}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to start spectator camera")
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/carla/spectator/stop")
+def stop_spectator_camera():
+    """Stop spectator camera."""
+    global spectator_streamer
+    
+    if spectator_streamer:
+        spectator_streamer.stop()
+        spectator_streamer = None
+    
+    return {"stopped": True}
+
+
+@app.get("/api/carla/spectator/frame")
+def get_spectator_frame():
+    """Get single spectator frame as base64 JPEG."""
+    global spectator_streamer
+    
+    if spectator_streamer is None:
+        return {"frame": None, "status": "spectator_not_started"}
+    
+    try:
+        frame = spectator_streamer.get_frame_base64()
+        if frame is None:
+            return {"frame": None, "status": "no_frame_yet"}
+        return {"frame": frame, "status": "ok"}
+    except Exception as e:
+        return {"frame": None, "status": "error", "error": str(e)}
+
+
+@app.post("/api/carla/spectator/location/{location}")
+def set_spectator_location(location: str):
+    """Change spectator camera location (overview, street, spectator)."""
+    global spectator_streamer
+    
+    if spectator_streamer is None:
+        raise HTTPException(status_code=400, detail="Spectator camera not started")
+    
+    spectator_streamer.set_location(location)
+    return {"location": location}
 
 
 if __name__ == "__main__":

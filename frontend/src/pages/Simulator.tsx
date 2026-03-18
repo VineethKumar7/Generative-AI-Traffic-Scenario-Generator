@@ -395,6 +395,7 @@ export default function Simulator() {
       {viewState === "preview" && selectedScenario && (
         <ScenarioPreview
           scenario={selectedScenario}
+          isConnected={connected}
           onBack={handleBack}
           onRunTest={handleRunTest}
         />
