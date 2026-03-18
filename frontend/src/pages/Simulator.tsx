@@ -84,21 +84,41 @@ export default function Simulator() {
     }
   };
 
-  const handleConnect = async () => {
+  const handleConnect = async (silent = false) => {
     setConnecting(true);
     try {
-      await api.connectCarla();
+      const result = await api.connectCarla();
       setConnected(true);
       localStorage.setItem('carla_autoconnect', 'true');
-      toast.success("Connected to CARLA", {
-        description: "CARLA server at localhost:2000",
-      });
+      if (!silent) {
+        toast.success("Connected to CARLA", {
+          description: result.message || "CARLA server at localhost:2000",
+        });
+      }
     } catch (e) {
-      toast.error("Failed to connect", {
-        description: e instanceof Error ? e.message : "CARLA server not available",
-      });
+      if (!silent) {
+        toast.error("Failed to connect", {
+          description: e instanceof Error ? e.message : "CARLA server not available. Is CARLA running?",
+        });
+      }
     } finally {
       setConnecting(false);
+    }
+  };
+  
+  // Auto-reconnect check
+  const checkConnection = async () => {
+    try {
+      const status = await api.getCarlaStatus();
+      if (!status.connected && connected) {
+        setConnected(false);
+        toast.warning("CARLA disconnected", { description: "Attempting to reconnect..." });
+        await handleConnect(true);
+      }
+    } catch {
+      if (connected) {
+        setConnected(false);
+      }
     }
   };
 

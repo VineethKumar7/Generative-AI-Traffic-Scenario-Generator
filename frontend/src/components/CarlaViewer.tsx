@@ -192,13 +192,19 @@ export function CarlaViewer({
         const res = await fetch(`${API_BASE}/api/carla/camera/frame`);
         if (res.ok) {
           const data = await res.json();
-          if (data.frame) {
+          if (data.frame && data.status === "ok") {
             setCurrentFrame(`data:image/jpeg;base64,${data.frame}`);
             setStreamConnected(true);
+          } else if (data.status === "camera_not_started" || data.status === "no_frame_yet") {
+            // Camera not ready yet, keep showing placeholder
+            setStreamConnected(false);
+          } else if (data.status === "error") {
+            console.warn("Camera frame error:", data.error);
           }
         }
       } catch {
-        // Frame not available yet, keep polling
+        // Network error, keep polling
+        setStreamConnected(false);
       }
     };
 

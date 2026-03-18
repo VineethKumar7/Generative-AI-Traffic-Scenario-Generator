@@ -476,8 +476,8 @@ def get_carla_status():
 
 
 @app.post("/api/carla/connect")
-def connect_carla():
-    """Connect to CARLA server."""
+def connect_carla(retries: int = 3, timeout: int = 10):
+    """Connect to CARLA server with retry logic."""
     global carla_runner, carla_connected
     
     if not CARLA_AVAILABLE:
@@ -489,18 +489,28 @@ def connect_carla():
             "message": "Connected in mock mode (CARLA package not installed)",
         }
     
-    try:
-        carla_runner = CarlaScenarioRunner(host="localhost", port=2000)
-        if carla_runner.connect():
-            carla_connected = True
-            return {
-                "connected": True,
-                "message": "Connected to CARLA server at localhost:2000",
-            }
-        else:
-            raise HTTPException(status_code=503, detail="Failed to connect to CARLA server")
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
+    last_error = None
+    for attempt in range(retries):
+        try:
+            carla_runner = CarlaScenarioRunner(host="localhost", port=2000, timeout=timeout)
+            if carla_runner.connect():
+                carla_connected = True
+                return {
+                    "connected": True,
+                    "message": f"Connected to CARLA server at localhost:2000 (attempt {attempt + 1})",
+                }
+            else:
+                last_error = "Connection returned False"
+        except Exception as e:
+            last_error = str(e)
+            print(f"CARLA connect attempt {attempt + 1}/{retries} failed: {e}")
+            if attempt < retries - 1:
+                time.sleep(2)  # Wait before retry
+    
+    raise HTTPException(
+        status_code=503, 
+        detail=f"Failed to connect to CARLA after {retries} attempts: {last_error}"
+    )
 
 
 @app.post("/api/carla/disconnect")
@@ -532,43 +542,71 @@ def _run_scenario_thread(filepath: str, scenario_id: str):
     """Background thread to run scenario."""
     global scenario_state, carla_runner, camera_streamer
     
+    start_time = time.time()
+    max_runtime = 120  # 2 minute max runtime
+    
     try:
-        # Start camera streaming if we have a vehicle
-        time.sleep(1)  # Wait for vehicle to spawn
+        # Verify CARLA connection before starting
+        if carla_runner is None or carla_runner.world is None:
+            scenario_state["error"] = "CARLA connection lost before scenario start"
+            scenario_state["running"] = False
+            return
+        
+        # Start camera streaming with retry
+        camera_started = False
+        for attempt in range(5):  # Try 5 times over ~5 seconds
+            time.sleep(1)
+            try:
+                world = carla_runner.world
+                if world is None:
+                    continue
+                vehicles = world.get_actors().filter('vehicle.*')
+                if len(vehicles) > 0:
+                    camera_streamer = CameraStreamer(
+                        world=world,
+                        vehicle=vehicles[0],
+                        width=800,
+                        height=600,
+                        camera_type='chase'
+                    )
+                    camera_streamer.start()
+                    camera_started = True
+                    print(f"Camera started on attempt {attempt + 1}")
+                    break
+            except Exception as e:
+                print(f"Camera start attempt {attempt + 1} failed: {e}")
+        
+        if not camera_started:
+            print("Warning: Could not start camera, continuing without streaming")
+        
+        # Run the scenario with timeout protection
         try:
-            world = carla_runner.world
-            vehicles = world.get_actors().filter('vehicle.*')
-            if len(vehicles) > 0:
-                camera_streamer = CameraStreamer(
-                    world=world,
-                    vehicle=vehicles[0],
-                    width=800,
-                    height=600,
-                    camera_type='chase'
-                )
-                camera_streamer.start()
+            result = carla_runner.run_scenario(filepath)
+            
+            scenario_state["result"] = {
+                "success": result.success,
+                "duration": result.duration_seconds,
+                "collisions": result.collision_count,
+                "error": result.error_message,
+            }
         except Exception as e:
-            print(f"Camera start failed: {e}")
-        
-        # Run the scenario
-        result = carla_runner.run_scenario(filepath)
-        
-        scenario_state["result"] = {
-            "success": result.success,
-            "duration": result.duration_seconds,
-            "collisions": result.collision_count,
-            "error": result.error_message,
-        }
+            elapsed = time.time() - start_time
+            if elapsed >= max_runtime:
+                scenario_state["error"] = f"Scenario timed out after {max_runtime}s"
+            else:
+                scenario_state["error"] = f"Scenario execution failed: {str(e)}"
+                
     except Exception as e:
-        scenario_state["error"] = str(e)
+        scenario_state["error"] = f"Unexpected error: {str(e)}"
     finally:
         scenario_state["running"] = False
-        # Stop camera
+        # Stop camera safely
         if camera_streamer:
             try:
                 camera_streamer.stop()
-            except:
-                pass
+            except Exception as e:
+                print(f"Camera stop error (ignored): {e}")
+            camera_streamer = None
 
 
 @app.post("/api/carla/run/{scenario_id}")
@@ -706,13 +744,16 @@ def get_camera_frame():
     global camera_streamer
     
     if camera_streamer is None:
-        raise HTTPException(status_code=400, detail="Camera not started")
+        # Return empty response instead of error - allows frontend to keep polling
+        return {"frame": None, "status": "camera_not_started"}
     
-    frame = camera_streamer.get_frame_base64()
-    if frame is None:
-        raise HTTPException(status_code=404, detail="No frame available")
-    
-    return {"frame": frame}
+    try:
+        frame = camera_streamer.get_frame_base64()
+        if frame is None:
+            return {"frame": None, "status": "no_frame_yet"}
+        return {"frame": frame, "status": "ok"}
+    except Exception as e:
+        return {"frame": None, "status": "error", "error": str(e)}
 
 
 @app.websocket("/ws/carla/stream")
