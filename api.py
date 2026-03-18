@@ -40,9 +40,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Output directory
+# Output directories
 SCENARIOS_DIR = Path(__file__).parent / "scenarios"
 SCENARIOS_DIR.mkdir(exist_ok=True)
+
+RECORDINGS_DIR = Path(__file__).parent / "recordings"
+RECORDINGS_DIR.mkdir(exist_ok=True)
 
 # Initialize generators
 generator = OpenScenarioGenerator(SCENARIOS_DIR)
@@ -411,6 +414,38 @@ def delete_scenario(scenario_id: str):
     return {"deleted": scenario_id}
 
 
+@app.get("/api/scenarios/{scenario_id}/video")
+def get_scenario_video(scenario_id: str):
+    """Download recorded video for a scenario."""
+    video_path = RECORDINGS_DIR / f"{scenario_id}.mp4"
+    
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video not found. Run the scenario first.")
+    
+    return FileResponse(
+        video_path,
+        media_type="video/mp4",
+        filename=f"{scenario_id}.mp4",
+    )
+
+
+@app.get("/api/scenarios/{scenario_id}/video/status")
+def get_video_status(scenario_id: str):
+    """Check if video exists for a scenario."""
+    video_path = RECORDINGS_DIR / f"{scenario_id}.mp4"
+    
+    if video_path.exists():
+        stat = video_path.stat()
+        return {
+            "available": True,
+            "path": str(video_path),
+            "size_mb": round(stat.st_size / (1024 * 1024), 2),
+            "created_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+        }
+    
+    return {"available": False}
+
+
 # Store last test result for report generation
 last_test_result: Optional[dict] = None
 
@@ -597,6 +632,7 @@ def _run_scenario_thread(filepath: str, scenario_id: str):
     
     start_time = time.time()
     max_runtime = 120  # 2 minute max runtime
+    video_path = None
     
     try:
         # Verify CARLA connection before starting
@@ -623,6 +659,7 @@ def _run_scenario_thread(filepath: str, scenario_id: str):
         
         # Poll for ego vehicle and start camera once available
         camera_started = False
+        recording_started = False
         for attempt in range(30):  # Try for 30 seconds
             time.sleep(1)
             
@@ -645,12 +682,18 @@ def _run_scenario_thread(filepath: str, scenario_id: str):
                         camera_streamer.start()
                         camera_started = True
                         print(f"Camera attached to ego vehicle on attempt {attempt + 1}")
+                        
+                        # Start recording immediately after camera starts
+                        if camera_streamer.start_recording(str(RECORDINGS_DIR), scenario_id):
+                            recording_started = True
+                            print(f"Video recording started for {scenario_id}")
+                        
                         break
             except Exception as e:
                 print(f"Camera start attempt {attempt + 1} failed: {e}")
         
         if not camera_started:
-            print("Warning: Could not start camera, continuing without streaming")
+            print("Warning: Could not start camera, continuing without streaming/recording")
         
         # Wait for scenario to complete
         scenario_thread.join(timeout=max_runtime)
@@ -670,12 +713,19 @@ def _run_scenario_thread(filepath: str, scenario_id: str):
             
         # Process result
         try:
+            # Stop recording and encode video before storing result
+            if camera_streamer and recording_started:
+                print("Encoding video...")
+                video_path = camera_streamer.stop_recording()
+                if video_path:
+                    print(f"Video saved: {video_path}")
             
             scenario_state["result"] = {
                 "success": result.success,
                 "duration": result.duration_seconds,
                 "collisions": result.collision_count,
                 "error": result.error_message,
+                "video_path": video_path,
             }
         except Exception as e:
             elapsed = time.time() - start_time
@@ -691,7 +741,7 @@ def _run_scenario_thread(filepath: str, scenario_id: str):
         # Clear ego vehicle reference
         if carla_runner:
             carla_runner.ego_vehicle = None
-        # Stop camera safely
+        # Stop camera safely (will also stop recording if still active)
         if camera_streamer:
             try:
                 camera_streamer.stop()
@@ -747,12 +797,19 @@ def get_scenario_status():
     if scenario_state["started_at"]:
         elapsed = time.time() - scenario_state["started_at"]
     
+    # Check for video availability
+    video_available = False
+    if scenario_state["scenario_id"]:
+        video_path = RECORDINGS_DIR / f"{scenario_state['scenario_id']}.mp4"
+        video_available = video_path.exists()
+    
     return {
         "running": scenario_state["running"],
         "scenario_id": scenario_state["scenario_id"],
         "elapsed_seconds": elapsed,
         "result": scenario_state["result"],
         "error": scenario_state["error"],
+        "video_available": video_available,
     }
 
 

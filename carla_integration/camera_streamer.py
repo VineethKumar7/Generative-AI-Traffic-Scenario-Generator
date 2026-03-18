@@ -3,13 +3,17 @@
 CARLA Camera Streamer
 
 Captures camera frames from CARLA and provides them for streaming.
+Supports video recording with ffmpeg encoding.
 """
 
 import io
+import os
 import base64
 import threading
 import queue
 import time
+import subprocess
+from pathlib import Path
 from typing import Optional, Callable
 import numpy as np
 
@@ -37,6 +41,11 @@ class CameraStreamer:
         # Get latest frame as base64 JPEG
         frame = streamer.get_frame_base64()
         
+        # Recording
+        streamer.start_recording("/path/to/recordings", "scenario_id")
+        # ... scenario runs ...
+        video_path = streamer.stop_recording()
+        
         streamer.stop()
     """
     
@@ -63,6 +72,14 @@ class CameraStreamer:
         
         # Frame queue for async processing
         self.frame_queue: queue.Queue = queue.Queue(maxsize=2)
+        
+        # Recording state
+        self.is_recording = False
+        self.recording_dir: Optional[Path] = None
+        self.scenario_id: Optional[str] = None
+        self.frame_count = 0
+        self.recording_fps = 30
+        self.video_path: Optional[str] = None
         
     def _get_camera_transform(self) -> 'carla.Transform':
         """Get camera transform based on camera type."""
@@ -138,7 +155,7 @@ class CameraStreamer:
             array = array[:, :, :3]  # Remove alpha -> BGR
             array = array[:, :, ::-1]  # BGR -> RGB
             
-            # Convert to JPEG
+            # Convert to JPEG for streaming
             if PIL_AVAILABLE:
                 pil_image = Image.fromarray(array)
                 buffer = io.BytesIO()
@@ -148,9 +165,15 @@ class CameraStreamer:
                 # Fallback: raw PNG using basic encoding
                 jpeg_bytes = self._encode_basic(array)
             
-            # Store latest frame
+            # Store latest frame for streaming
             with self.frame_lock:
                 self.latest_frame = jpeg_bytes
+            
+            # Save frame to disk if recording
+            if self.is_recording and self.recording_dir and PIL_AVAILABLE:
+                frame_path = self.recording_dir / f"frame_{self.frame_count:06d}.jpg"
+                pil_image.save(frame_path, format='JPEG', quality=85)
+                self.frame_count += 1
                 
         except Exception as e:
             print(f"Frame processing error: {e}")
@@ -188,6 +211,10 @@ class CameraStreamer:
         """Stop the camera and cleanup."""
         self.running = False
         
+        # Stop recording if active
+        if self.is_recording:
+            self.stop_recording()
+        
         if self.camera:
             try:
                 self.camera.stop()
@@ -198,6 +225,129 @@ class CameraStreamer:
             
         self.latest_frame = None
         print("Camera stopped")
+    
+    def start_recording(self, base_dir: str, scenario_id: str) -> bool:
+        """
+        Start recording frames to disk.
+        
+        Args:
+            base_dir: Base directory for recordings
+            scenario_id: Unique identifier for this recording
+            
+        Returns:
+            True if recording started successfully
+        """
+        if self.is_recording:
+            print("Already recording")
+            return False
+            
+        if not PIL_AVAILABLE:
+            print("PIL required for recording")
+            return False
+        
+        # Create recording directory
+        self.recording_dir = Path(base_dir) / scenario_id
+        self.recording_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.scenario_id = scenario_id
+        self.frame_count = 0
+        self.is_recording = True
+        
+        print(f"Recording started: {self.recording_dir}")
+        return True
+    
+    def stop_recording(self) -> Optional[str]:
+        """
+        Stop recording and encode video.
+        
+        Returns:
+            Path to encoded video, or None if encoding failed
+        """
+        if not self.is_recording:
+            return None
+            
+        self.is_recording = False
+        print(f"Recording stopped: {self.frame_count} frames captured")
+        
+        if self.frame_count < 5:
+            print("Too few frames to encode")
+            return None
+        
+        # Encode video with ffmpeg
+        video_path = self._encode_video()
+        
+        # Cleanup frames after encoding
+        if video_path:
+            self._cleanup_frames()
+        
+        return video_path
+    
+    def _encode_video(self) -> Optional[str]:
+        """Encode recorded frames to MP4 using ffmpeg."""
+        if not self.recording_dir or not self.scenario_id:
+            return None
+        
+        # Output video path (in parent directory, not frames folder)
+        video_path = self.recording_dir.parent / f"{self.scenario_id}.mp4"
+        frames_pattern = str(self.recording_dir / "frame_%06d.jpg")
+        
+        # ffmpeg command for encoding
+        cmd = [
+            "ffmpeg",
+            "-y",  # Overwrite output
+            "-framerate", str(self.recording_fps),
+            "-i", frames_pattern,
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",  # Web-friendly
+            str(video_path)
+        ]
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120  # 2 minute timeout
+            )
+            
+            if result.returncode == 0:
+                self.video_path = str(video_path)
+                print(f"Video encoded: {video_path}")
+                return str(video_path)
+            else:
+                print(f"ffmpeg error: {result.stderr}")
+                return None
+                
+        except subprocess.TimeoutExpired:
+            print("ffmpeg encoding timed out")
+            return None
+        except FileNotFoundError:
+            print("ffmpeg not found - install with: apt install ffmpeg")
+            return None
+        except Exception as e:
+            print(f"Encoding error: {e}")
+            return None
+    
+    def _cleanup_frames(self):
+        """Remove individual frame files after encoding."""
+        if not self.recording_dir:
+            return
+            
+        try:
+            for frame_file in self.recording_dir.glob("frame_*.jpg"):
+                frame_file.unlink()
+            # Remove empty directory
+            self.recording_dir.rmdir()
+            print("Frame files cleaned up")
+        except Exception as e:
+            print(f"Cleanup warning: {e}")
+    
+    def get_video_path(self) -> Optional[str]:
+        """Get path to the last recorded video."""
+        return self.video_path
 
 
 class MultiCameraStreamer:
