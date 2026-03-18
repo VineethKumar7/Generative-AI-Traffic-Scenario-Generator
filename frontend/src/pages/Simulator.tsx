@@ -288,11 +288,40 @@ export default function Simulator() {
     toast.success("Report downloaded", { description: `report_${testResult.scenario.id}.json` });
   };
 
-  const handleDownloadVideo = () => {
-    toast.info("Video recording", { 
-      description: "Video recording will be available in a future update. Frames are captured during runs.",
-      duration: 4000,
-    });
+  const handleDownloadVideo = async () => {
+    const scenarioId = testResult?.scenario?.id || selectedScenario?.id;
+    if (!scenarioId) {
+      toast.error("No scenario selected");
+      return;
+    }
+
+    try {
+      // Check if video exists
+      const status = await api.getVideoStatus(scenarioId);
+      if (!status.available) {
+        toast.error("Video not available", {
+          description: "Run the scenario first to record video.",
+        });
+        return;
+      }
+
+      // Download video
+      const url = `${api.baseUrl}/api/scenarios/${scenarioId}/video`;
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${scenarioId}.mp4`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+
+      toast.success("Video download started", {
+        description: `${scenarioId}.mp4 (${status.size_mb} MB)`,
+      });
+    } catch {
+      toast.error("Failed to download video", {
+        description: "Video may not exist or server error.",
+      });
+    }
   };
 
   // Render different views based on state

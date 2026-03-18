@@ -51,7 +51,7 @@ export interface ScenarioListResponse {
 }
 
 class ScenarioAPI {
-  private baseUrl: string;
+  public baseUrl: string;
 
   constructor(baseUrl: string = API_BASE) {
     this.baseUrl = baseUrl;
@@ -185,10 +185,21 @@ class ScenarioAPI {
       duration: number;
       collisions: number;
       error?: string;
+      video_path?: string;
     } | null;
     error: string | null;
+    video_available: boolean;
   }> {
     return this.fetch('/api/carla/run/status');
+  }
+
+  async getVideoStatus(scenarioId: string): Promise<{
+    available: boolean;
+    path?: string;
+    size_mb?: number;
+    created_at?: string;
+  }> {
+    return this.fetch(`/api/scenarios/${scenarioId}/video/status`);
   }
 
   async startCamera(cameraType: string = 'chase'): Promise<{ started: boolean }> {
