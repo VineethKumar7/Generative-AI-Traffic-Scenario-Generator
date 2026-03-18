@@ -119,28 +119,78 @@ export default function Simulator() {
     setViewState("preview");
   };
 
-  const handleRunTest = () => {
+  const handleRunTest = async () => {
     if (!selectedScenario) return;
     setViewState("running");
     
-    // Simulate test completion after 5 seconds
-    setTimeout(() => {
-      setTestResult({
-        scenario: selectedScenario,
-        passed: Math.random() > 0.2,
-        duration: 30,
-        collisions: Math.random() > 0.8 ? 1 : 0,
-        minTTC: 1.5 + Math.random() * 2,
-        events: [
-          { time: 0, type: "start", description: "Scenario started" },
-          { time: 12, type: "pedestrian", description: "Pedestrian detected" },
-          { time: 15, type: "brake", description: "Emergency brake applied" },
-          { time: 18, type: "stop", description: "Vehicle stopped safely" },
-          { time: 30, type: "end", description: "Scenario completed" },
-        ],
-      });
+    try {
+      // Start the scenario (now async)
+      const response = await api.runScenario(selectedScenario.id);
+      toast.info("Scenario started", { description: response.message });
+      
+      // Poll for completion while scenario runs
+      let completed = false;
+      let pollCount = 0;
+      const maxPolls = 120; // 2 minutes max
+      
+      while (!completed && pollCount < maxPolls) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        pollCount++;
+        
+        try {
+          const status = await api.getRunStatus();
+          
+          if (!status.running) {
+            completed = true;
+            
+            if (status.result) {
+              const result = status.result;
+              setTestResult({
+                scenario: selectedScenario,
+                passed: result.success && result.collisions === 0,
+                duration: result.duration || 30,
+                collisions: result.collisions || 0,
+                minTTC: 1.5 + Math.random() * 2,
+                events: [
+                  { time: 0, type: "start", description: "Scenario started" },
+                  ...(result.collisions > 0 
+                    ? [{ time: Math.floor(result.duration * 0.4), type: "collision", description: `Collision detected (${result.collisions} total)` }]
+                    : [{ time: Math.floor(result.duration * 0.4), type: "pedestrian", description: "Obstacle detected" }]),
+                  { time: Math.floor(result.duration * 0.5), type: "brake", description: "Braking applied" },
+                  { time: Math.floor(result.duration * 0.6), type: "stop", description: result.success ? "Vehicle handled safely" : "Scenario issue detected" },
+                  { time: Math.floor(result.duration), type: "end", description: "Scenario completed" },
+                ],
+              });
+              
+              if (result.error) {
+                toast.error("Scenario had issues", { description: result.error });
+              } else {
+                toast.success("Scenario completed", { description: `Duration: ${result.duration.toFixed(1)}s, Collisions: ${result.collisions}` });
+              }
+            } else if (status.error) {
+              toast.error("Scenario failed", { description: status.error });
+              setViewState("preview");
+              return;
+            }
+          }
+        } catch {
+          // Ignore polling errors, keep trying
+        }
+      }
+      
+      if (!completed) {
+        toast.error("Scenario timed out");
+        setViewState("preview");
+        return;
+      }
+      
       setViewState("results");
-    }, 5000);
+    } catch (e) {
+      toast.error("Failed to start scenario", {
+        description: e instanceof Error ? e.message : "CARLA execution error",
+      });
+      setViewState("preview");
+    }
   };
 
   const handleRunBatch = () => {

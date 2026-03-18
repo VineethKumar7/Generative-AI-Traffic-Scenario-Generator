@@ -176,6 +176,37 @@ class ScenarioAPI {
     return this.fetch(`/api/carla/run/${scenarioId}`, { method: 'POST' });
   }
 
+  async getRunStatus(): Promise<{
+    running: boolean;
+    scenario_id: string | null;
+    elapsed_seconds: number;
+    result: {
+      success: boolean;
+      duration: number;
+      collisions: number;
+      error?: string;
+    } | null;
+    error: string | null;
+  }> {
+    return this.fetch('/api/carla/run/status');
+  }
+
+  async startCamera(cameraType: string = 'chase'): Promise<{ started: boolean }> {
+    return this.fetch(`/api/carla/camera/start?camera_type=${cameraType}`, { method: 'POST' });
+  }
+
+  async stopCamera(): Promise<{ stopped: boolean }> {
+    return this.fetch('/api/carla/camera/stop', { method: 'POST' });
+  }
+
+  async getCameraFrame(): Promise<{ frame: string } | null> {
+    try {
+      return await this.fetch('/api/carla/camera/frame');
+    } catch {
+      return null;
+    }
+  }
+
   async stopScenario(): Promise<{ stopped: boolean; message: string }> {
     return this.fetch('/api/carla/stop', { method: 'POST' });
   }

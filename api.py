@@ -7,11 +7,13 @@ Connects the React frontend to the scenario generation engine.
 
 import os
 import json
+import time
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List
 import asyncio
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -515,31 +517,113 @@ def disconnect_carla():
     }
 
 
-@app.post("/api/carla/run/{scenario_id}")
-def run_scenario_in_carla(scenario_id: str):
-    """Run a scenario in CARLA."""
-    global carla_runner, carla_connected
+# Track running scenario state
+scenario_state = {
+    "running": False,
+    "scenario_id": None,
+    "started_at": None,
+    "result": None,
+    "error": None,
+}
+scenario_thread: Optional[threading.Thread] = None
+
+
+def _run_scenario_thread(filepath: str, scenario_id: str):
+    """Background thread to run scenario."""
+    global scenario_state, carla_runner, camera_streamer
     
-    if not carla_connected or carla_runner is None:
-        raise HTTPException(status_code=400, detail="Not connected to CARLA")
-    
-    filepath = SCENARIOS_DIR / f"{scenario_id}.xosc"
-    if not filepath.exists():
-        raise HTTPException(status_code=404, detail="Scenario not found")
-    
-    # Run scenario (this will be async in future)
-    result = carla_runner.run_scenario(str(filepath))
-    
-    return {
-        "started": True,
-        "scenario_id": scenario_id,
-        "message": f"Running {filepath.name}",
-        "result": {
+    try:
+        # Start camera streaming if we have a vehicle
+        time.sleep(1)  # Wait for vehicle to spawn
+        try:
+            world = carla_runner.world
+            vehicles = world.get_actors().filter('vehicle.*')
+            if len(vehicles) > 0:
+                camera_streamer = CameraStreamer(
+                    world=world,
+                    vehicle=vehicles[0],
+                    width=800,
+                    height=600,
+                    camera_type='chase'
+                )
+                camera_streamer.start()
+        except Exception as e:
+            print(f"Camera start failed: {e}")
+        
+        # Run the scenario
+        result = carla_runner.run_scenario(filepath)
+        
+        scenario_state["result"] = {
             "success": result.success,
             "duration": result.duration_seconds,
             "collisions": result.collision_count,
             "error": result.error_message,
         }
+    except Exception as e:
+        scenario_state["error"] = str(e)
+    finally:
+        scenario_state["running"] = False
+        # Stop camera
+        if camera_streamer:
+            try:
+                camera_streamer.stop()
+            except:
+                pass
+
+
+@app.post("/api/carla/run/{scenario_id}")
+def run_scenario_in_carla(scenario_id: str, background_tasks: BackgroundTasks):
+    """Start a scenario in CARLA (async)."""
+    global carla_runner, carla_connected, scenario_state, scenario_thread
+    
+    if not carla_connected or carla_runner is None:
+        raise HTTPException(status_code=400, detail="Not connected to CARLA")
+    
+    if scenario_state["running"]:
+        raise HTTPException(status_code=400, detail="A scenario is already running")
+    
+    filepath = SCENARIOS_DIR / f"{scenario_id}.xosc"
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Scenario not found")
+    
+    # Reset state
+    scenario_state = {
+        "running": True,
+        "scenario_id": scenario_id,
+        "started_at": time.time(),
+        "result": None,
+        "error": None,
+    }
+    
+    # Start scenario in background thread
+    scenario_thread = threading.Thread(
+        target=_run_scenario_thread,
+        args=(str(filepath), scenario_id)
+    )
+    scenario_thread.start()
+    
+    return {
+        "started": True,
+        "scenario_id": scenario_id,
+        "message": f"Started {filepath.name}",
+    }
+
+
+@app.get("/api/carla/run/status")
+def get_scenario_status():
+    """Get current scenario run status."""
+    global scenario_state
+    
+    elapsed = 0
+    if scenario_state["started_at"]:
+        elapsed = time.time() - scenario_state["started_at"]
+    
+    return {
+        "running": scenario_state["running"],
+        "scenario_id": scenario_state["scenario_id"],
+        "elapsed_seconds": elapsed,
+        "result": scenario_state["result"],
+        "error": scenario_state["error"],
     }
 
 

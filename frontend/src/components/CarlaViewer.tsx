@@ -66,9 +66,10 @@ export function CarlaViewer({
   const [isPaused, setIsPaused] = useState(false);
   const [progress, setProgress] = useState(0);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
-  const [useRealStream, setUseRealStream] = useState(false);
+  const [useRealStream, setUseRealStream] = useState(true); // Default ON
   const [streamConnected, setStreamConnected] = useState(false);
   const [currentFrame, setCurrentFrame] = useState<string | null>(null);
+  const framePollingRef = useRef<NodeJS.Timeout | null>(null);
   const [metrics, setMetrics] = useState<Metrics>({
     speed: 0,
     ttc: 999,
@@ -169,8 +170,51 @@ export function CarlaViewer({
       if (wsRef.current) {
         wsRef.current.close();
       }
+      if (framePollingRef.current) {
+        clearInterval(framePollingRef.current);
+      }
     };
   }, []);
+
+  // Poll camera frames when running with real stream enabled
+  useEffect(() => {
+    if (!isRunning || !useRealStream || !isConnected) {
+      if (framePollingRef.current) {
+        clearInterval(framePollingRef.current);
+        framePollingRef.current = null;
+      }
+      return;
+    }
+
+    // Poll for frames at ~15 FPS
+    const pollFrames = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/carla/camera/frame`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.frame) {
+            setCurrentFrame(`data:image/jpeg;base64,${data.frame}`);
+            setStreamConnected(true);
+          }
+        }
+      } catch {
+        // Frame not available yet, keep polling
+      }
+    };
+
+    // Start polling
+    pollFrames(); // Initial fetch
+    framePollingRef.current = setInterval(pollFrames, 66); // ~15 FPS
+
+    return () => {
+      if (framePollingRef.current) {
+        clearInterval(framePollingRef.current);
+        framePollingRef.current = null;
+      }
+      setStreamConnected(false);
+      setCurrentFrame(null);
+    };
+  }, [isRunning, useRealStream, isConnected]);
 
   // Simulated CARLA view with animated canvas (fallback when no real stream)
   useEffect(() => {
