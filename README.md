@@ -6,6 +6,37 @@ Generate [OpenSCENARIO](https://www.asam.net/standards/detail/openscenario/) fil
 ![OpenSCENARIO](https://img.shields.io/badge/OpenSCENARIO-1.0-green)
 ![CARLA](https://img.shields.io/badge/CARLA-0.9.13%2B-orange)
 
+---
+
+## 📸 Screenshots
+
+### Dashboard
+*Overview of generated scenarios with quick actions and recent activity*
+
+![Dashboard](docs/assets/screenshot_dashboard.jpg)
+
+### Scenario Builder
+*Configure weather, time of day, road type, traffic density, and edge cases*
+
+![Scenario Builder](docs/assets/screenshot_builder.jpg)
+
+### Simulator with Live Preview
+*Execute scenarios in CARLA with real-time camera feed*
+
+![Simulator](docs/assets/screenshot_simulator.jpg)
+
+---
+
+## 🎬 Demo Video
+
+Watch a scenario running in CARLA with automated vehicle control:
+
+https://github.com/user-attachments/assets/demo_video.mp4
+
+> **[▶️ Download Demo Video](docs/assets/demo_video.mp4)** — 30-second scenario execution showing autonomous vehicle navigation in CARLA Town01.
+
+---
+
 ## ✨ Features
 
 - **OpenSCENARIO 1.0 compliant** — Standard `.xosc` XML output
@@ -214,6 +245,8 @@ Base URL: `http://localhost:8000`
 | `GET` | `/api/scenarios` | List all scenarios |
 | `GET` | `/api/scenarios/{id}` | Get scenario details |
 | `GET` | `/api/scenarios/{id}/download` | Download .xosc file |
+| `GET` | `/api/scenarios/{id}/video` | Download recorded video |
+| `GET` | `/api/scenarios/{id}/video/status` | Check video availability |
 | `DELETE` | `/api/scenarios/{id}` | Delete scenario |
 
 ### Example: Generate Scenario
@@ -312,6 +345,24 @@ print(f"Distance: {result.distance_traveled}m")
 results = runner.run_batch("scenarios/")
 runner.generate_report(results, "test_report.json")
 ```
+
+### Video Recording
+
+Scenarios are automatically recorded during execution:
+
+- **Frames captured** at 30 FPS from chase camera
+- **Encoded to MP4** with H.264 when scenario completes
+- **Download via API** or web interface
+
+```bash
+# Check if video exists
+curl http://localhost:8000/api/scenarios/{scenario_id}/video/status
+
+# Download video
+curl -O http://localhost:8000/api/scenarios/{scenario_id}/video
+```
+
+Videos are stored in `recordings/` directory.
 
 ### Metrics Collected
 
