@@ -26,6 +26,57 @@ Generate [OpenSCENARIO](https://www.asam.net/standards/detail/openscenario/) fil
 
 ---
 
+## 💻 System Requirements
+
+### Minimum Requirements
+
+| Component | Requirement |
+|-----------|-------------|
+| **OS** | Linux (Ubuntu 22.04+ recommended) |
+| **CPU** | 4 cores, 2.5 GHz+ |
+| **RAM** | 8 GB (16 GB+ recommended for CARLA) |
+| **GPU** | NVIDIA GPU with 4 GB+ VRAM (for CARLA) |
+| **Disk** | 15 GB free space (with CARLA) |
+| **Python** | 3.10+ |
+| **Node.js** | 18+ |
+
+### CARLA Requirements
+
+CARLA simulator is optional but recommended for scenario execution:
+
+| Component | Requirement |
+|-----------|-------------|
+| **CARLA Version** | 0.9.13+ |
+| **GPU Driver** | NVIDIA 470+ or Vulkan 1.1 compatible |
+| **VRAM** | 4 GB minimum, 6 GB+ recommended |
+
+> **Note:** Without CARLA, the system runs in mock mode — scenarios are generated and validated but not executed in simulation.
+
+### Tested System
+
+This project has been developed and tested on:
+
+| Component | Specification |
+|-----------|---------------|
+| **OS** | Ubuntu 24.04.4 LTS (Noble Numbat) |
+| **Kernel** | 6.17.0-19-generic |
+| **CPU** | AMD Ryzen 9 5900HX (8 cores / 16 threads) |
+| **GPU** | NVIDIA GeForce RTX 3060 Laptop (6 GB VRAM) |
+| **RAM** | 24 GB DDR4 |
+| **CARLA** | 0.9.13 |
+
+### Platform Support
+
+| Platform | Status | Notes |
+|----------|--------|-------|
+| **Ubuntu 22.04+** | ✅ Fully supported | Primary development platform |
+| **Ubuntu 20.04** | ✅ Supported | May need Python 3.10 PPA |
+| **Debian 12+** | ⚠️ Should work | Not officially tested |
+| **Windows 10/11** | ⚠️ Partial | WSL2 recommended; native CARLA available |
+| **macOS** | ❌ Limited | No CARLA support; API/frontend only |
+
+---
+
 ## 🚀 Quick Start
 
 ### Option 1: Full Stack (Recommended)
@@ -50,6 +101,14 @@ cd ~/clawd/projects/scenario-generator
 **Stop all services:**
 ```bash
 ./stop.sh
+```
+
+**Restart all services:**
+```bash
+./restart.sh
+
+# Or without CARLA
+./restart.sh --no-carla
 ```
 
 ### Option 2: CLI Only
@@ -282,6 +341,7 @@ scenario-generator/
 ├── requirements.txt         # Python dependencies
 ├── start.sh                 # Start all services
 ├── stop.sh                  # Stop all services
+├── restart.sh               # Restart all services
 │
 ├── frontend/                # React web application
 │   ├── src/
