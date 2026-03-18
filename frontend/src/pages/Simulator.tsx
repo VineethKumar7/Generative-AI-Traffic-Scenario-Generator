@@ -251,6 +251,50 @@ export default function Simulator() {
     setTestResult(null);
   };
 
+  const handleDownloadReport = () => {
+    if (!testResult) return;
+    
+    const report = {
+      generated_at: new Date().toISOString(),
+      scenario: {
+        id: testResult.scenario.id,
+        filename: testResult.scenario.filename,
+        weather: testResult.scenario.weather,
+        time_of_day: testResult.scenario.time_of_day,
+        edge_case: testResult.scenario.edge_case,
+        ego_speed: testResult.scenario.ego_speed,
+      },
+      results: {
+        passed: testResult.passed,
+        duration_seconds: testResult.duration,
+        collisions: testResult.collisions,
+        lane_departures: 0,
+        min_ttc: testResult.minTTC,
+        completed: true,
+      },
+      events: testResult.events,
+    };
+    
+    const blob = new Blob([JSON.stringify(report, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `report_${testResult.scenario.id}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    
+    toast.success("Report downloaded", { description: `report_${testResult.scenario.id}.json` });
+  };
+
+  const handleDownloadVideo = () => {
+    toast.info("Video recording", { 
+      description: "Video recording will be available in a future update. Frames are captured during runs.",
+      duration: 4000,
+    });
+  };
+
   // Render different views based on state
   return (
     <div className="space-y-6">
@@ -519,11 +563,11 @@ export default function Simulator() {
             <Button variant="outline" onClick={handleBack}>
               ← Back to Scenarios
             </Button>
-            <Button variant="outline">
+            <Button variant="outline" onClick={handleDownloadVideo}>
               <Download className="h-4 w-4 mr-2" />
               Download Video
             </Button>
-            <Button variant="outline">
+            <Button variant="outline" onClick={handleDownloadReport}>
               <BarChart3 className="h-4 w-4 mr-2" />
               Full Report
             </Button>

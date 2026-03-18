@@ -411,6 +411,59 @@ def delete_scenario(scenario_id: str):
     return {"deleted": scenario_id}
 
 
+# Store last test result for report generation
+last_test_result: Optional[dict] = None
+
+
+@app.get("/api/scenarios/{scenario_id}/report")
+def get_scenario_report(scenario_id: str):
+    """Get detailed test report for a scenario."""
+    global last_test_result, scenario_state
+    
+    filepath = SCENARIOS_DIR / f"{scenario_id}.xosc"
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Scenario not found")
+    
+    meta = get_scenario_metadata(filepath)
+    
+    # Get last run result if available
+    run_result = None
+    if scenario_state.get("scenario_id") == scenario_id and scenario_state.get("result"):
+        run_result = scenario_state["result"]
+    
+    report = {
+        "generated_at": datetime.now().isoformat(),
+        "scenario": {
+            "id": meta["id"],
+            "filename": meta["filename"],
+            "weather": meta["weather"],
+            "time_of_day": meta["time_of_day"],
+            "edge_case": meta.get("edge_case", "unknown"),
+            "ego_speed": meta.get("ego_speed", 60),
+            "created_at": meta["created_at"],
+        },
+        "test_results": run_result,
+        "analysis": {
+            "passed": run_result.get("success", False) if run_result else None,
+            "collision_severity": "high" if run_result and run_result.get("collisions", 0) > 10 else "low" if run_result else None,
+            "recommendations": [],
+        }
+    }
+    
+    # Add recommendations based on results
+    if run_result:
+        if run_result.get("collisions", 0) > 0:
+            report["analysis"]["recommendations"].append(
+                "High collision count detected. Consider adjusting autopilot parameters or filtering minor lane marker contacts."
+            )
+        if run_result.get("duration", 0) < 10:
+            report["analysis"]["recommendations"].append(
+                "Short scenario duration. Verify scenario completed successfully."
+            )
+    
+    return report
+
+
 @app.get("/api/templates")
 def list_templates():
     """List available scenario templates."""
