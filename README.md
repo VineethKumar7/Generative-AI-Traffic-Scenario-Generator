@@ -8,6 +8,16 @@ Generate [OpenSCENARIO](https://www.asam.net/standards/detail/openscenario/) fil
 
 ---
 
+## 🎬 Demo Video
+
+Watch a scenario running in CARLA with automated vehicle control:
+
+![Demo - Scenario Execution in CARLA](docs/assets/demo.gif)
+
+> **[▶️ Download Full Video (MP4)](docs/assets/demo_video.mp4)** — 30-second scenario execution showing autonomous vehicle navigation in CARLA Town01.
+
+---
+
 ## 📸 Screenshots
 
 ### Dashboard
@@ -24,18 +34,6 @@ Generate [OpenSCENARIO](https://www.asam.net/standards/detail/openscenario/) fil
 *Execute scenarios in CARLA with real-time camera feed*
 
 ![Simulator](docs/assets/screenshot_simulator.jpg)
-
----
-
-## 🎬 Demo Video
-
-Watch a scenario running in CARLA with automated vehicle control:
-
-<video src="https://github.com/VineethKumar7/Generative-AI-Traffic-Scenario-Generator/raw/main/docs/assets/demo_video.mp4" controls width="100%" autoplay muted loop>
-  Your browser does not support the video tag. <a href="docs/assets/demo_video.mp4">Download the video</a>.
-</video>
-
-> **[▶️ Download Demo Video](docs/assets/demo_video.mp4)** — 30-second scenario execution showing autonomous vehicle navigation in CARLA Town01.
 
 ---
 
