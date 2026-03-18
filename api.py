@@ -10,9 +10,10 @@ import json
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List
-from fastapi import FastAPI, HTTPException
+import asyncio
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from scenario_generator import (
@@ -439,6 +440,7 @@ def list_options():
 # ============ CARLA Integration ============
 
 from carla_integration.runner import CarlaScenarioRunner, CARLA_AVAILABLE
+from carla_integration.camera_streamer import CameraStreamer
 
 # Global CARLA runner instance
 carla_runner: Optional[CarlaScenarioRunner] = None
@@ -551,6 +553,117 @@ def stop_carla_scenario():
         "stopped": True,
         "message": "Scenario stopped",
     }
+
+
+# ============ Camera Streaming ============
+
+camera_streamer: Optional[CameraStreamer] = None
+
+
+@app.post("/api/carla/camera/start")
+def start_camera(camera_type: str = "chase"):
+    """Start camera streaming from CARLA."""
+    global camera_streamer, carla_runner, carla_connected
+    
+    if not carla_connected or carla_runner is None:
+        raise HTTPException(status_code=400, detail="Not connected to CARLA")
+    
+    if not CARLA_AVAILABLE:
+        raise HTTPException(status_code=400, detail="CARLA not available")
+    
+    try:
+        import carla
+        
+        # Get ego vehicle from world
+        world = carla_runner.world
+        if world is None:
+            raise HTTPException(status_code=400, detail="CARLA world not available")
+        
+        # Find ego vehicle (usually named 'hero' or first vehicle)
+        vehicles = world.get_actors().filter('vehicle.*')
+        if len(vehicles) == 0:
+            raise HTTPException(status_code=400, detail="No vehicles in scene")
+        
+        ego_vehicle = vehicles[0]  # Take first vehicle as ego
+        
+        # Create and start camera streamer
+        camera_streamer = CameraStreamer(
+            world=world,
+            vehicle=ego_vehicle,
+            width=800,
+            height=600,
+            camera_type=camera_type
+        )
+        
+        if camera_streamer.start():
+            return {"started": True, "camera_type": camera_type}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to start camera")
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/carla/camera/stop")
+def stop_camera():
+    """Stop camera streaming."""
+    global camera_streamer
+    
+    if camera_streamer:
+        camera_streamer.stop()
+        camera_streamer = None
+    
+    return {"stopped": True}
+
+
+@app.get("/api/carla/camera/frame")
+def get_camera_frame():
+    """Get single camera frame as base64 JPEG."""
+    global camera_streamer
+    
+    if camera_streamer is None:
+        raise HTTPException(status_code=400, detail="Camera not started")
+    
+    frame = camera_streamer.get_frame_base64()
+    if frame is None:
+        raise HTTPException(status_code=404, detail="No frame available")
+    
+    return {"frame": frame}
+
+
+@app.websocket("/ws/carla/stream")
+async def websocket_camera_stream(websocket: WebSocket):
+    """WebSocket endpoint for real-time camera streaming."""
+    global camera_streamer
+    
+    await websocket.accept()
+    
+    try:
+        while True:
+            if camera_streamer:
+                frame = camera_streamer.get_frame_base64()
+                if frame:
+                    await websocket.send_json({"frame": frame})
+            
+            # ~30 FPS
+            await asyncio.sleep(0.033)
+            
+    except WebSocketDisconnect:
+        print("WebSocket disconnected")
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+
+
+@app.post("/api/carla/camera/type/{camera_type}")
+def set_camera_type(camera_type: str):
+    """Change camera view type (chase, hood, bird)."""
+    global camera_streamer
+    
+    if camera_streamer is None:
+        raise HTTPException(status_code=400, detail="Camera not started")
+    
+    camera_streamer.set_camera_type(camera_type)
+    return {"camera_type": camera_type}
 
 
 if __name__ == "__main__":

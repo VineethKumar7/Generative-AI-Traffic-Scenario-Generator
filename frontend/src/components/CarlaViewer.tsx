@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Slider } from "@/components/ui/slider";
@@ -20,7 +20,10 @@ import {
   Gauge,
   AlertTriangle,
   Car,
+  Video,
+  VideoOff,
 } from "lucide-react";
+import { toast } from "sonner";
 
 interface CarlaViewerProps {
   scenarioName?: string;
@@ -45,9 +48,10 @@ const CAMERA_OPTIONS = [
   { id: "bird", label: "Bird's Eye", icon: "🦅" },
   { id: "chase", label: "Chase Cam", icon: "🚗" },
   { id: "hood", label: "Hood View", icon: "🎯" },
-  { id: "fpv", label: "First Person", icon: "👁️" },
-  { id: "free", label: "Free Camera", icon: "🎥" },
 ];
+
+const API_BASE = "http://localhost:8000";
+const WS_BASE = "ws://localhost:8000";
 
 export function CarlaViewer({
   scenarioName = "scenario_rainy_night.xosc",
@@ -62,6 +66,9 @@ export function CarlaViewer({
   const [isPaused, setIsPaused] = useState(false);
   const [progress, setProgress] = useState(0);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const [useRealStream, setUseRealStream] = useState(false);
+  const [streamConnected, setStreamConnected] = useState(false);
+  const [currentFrame, setCurrentFrame] = useState<string | null>(null);
   const [metrics, setMetrics] = useState<Metrics>({
     speed: 0,
     ttc: 999,
@@ -71,11 +78,103 @@ export function CarlaViewer({
     laneDeparts: 0,
   });
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
   const animationRef = useRef<number>();
+  const wsRef = useRef<WebSocket | null>(null);
 
-  // Simulate CARLA view with animated canvas
+  // Start camera streaming
+  const startCamera = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/carla/camera/start?camera_type=${camera}`, {
+        method: "POST",
+      });
+      if (!res.ok) throw new Error("Failed to start camera");
+      
+      // Connect WebSocket for streaming
+      wsRef.current = new WebSocket(`${WS_BASE}/ws/carla/stream`);
+      
+      wsRef.current.onopen = () => {
+        setStreamConnected(true);
+        toast.success("Camera stream connected");
+      };
+      
+      wsRef.current.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        if (data.frame) {
+          setCurrentFrame(`data:image/jpeg;base64,${data.frame}`);
+        }
+      };
+      
+      wsRef.current.onclose = () => {
+        setStreamConnected(false);
+      };
+      
+      wsRef.current.onerror = () => {
+        setStreamConnected(false);
+        toast.error("Camera stream error");
+      };
+      
+    } catch (error) {
+      console.error("Camera start error:", error);
+      toast.error("Failed to start camera stream");
+      setUseRealStream(false);
+    }
+  }, [camera]);
+
+  // Stop camera streaming
+  const stopCamera = useCallback(async () => {
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    
+    try {
+      await fetch(`${API_BASE}/api/carla/camera/stop`, { method: "POST" });
+    } catch {
+      // Ignore errors
+    }
+    
+    setStreamConnected(false);
+    setCurrentFrame(null);
+  }, []);
+
+  // Toggle real stream
+  const toggleRealStream = useCallback(async () => {
+    if (useRealStream) {
+      await stopCamera();
+      setUseRealStream(false);
+    } else {
+      setUseRealStream(true);
+      await startCamera();
+    }
+  }, [useRealStream, startCamera, stopCamera]);
+
+  // Change camera type
+  const handleCameraChange = useCallback(async (newCamera: string) => {
+    setCamera(newCamera);
+    if (useRealStream && streamConnected) {
+      try {
+        await fetch(`${API_BASE}/api/carla/camera/type/${newCamera}`, {
+          method: "POST",
+        });
+      } catch {
+        // Ignore
+      }
+    }
+  }, [useRealStream, streamConnected]);
+
+  // Cleanup on unmount
   useEffect(() => {
-    if (!canvasRef.current || !isRunning || isPaused) return;
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+    };
+  }, []);
+
+  // Simulated CARLA view with animated canvas (fallback when no real stream)
+  useEffect(() => {
+    if (!canvasRef.current || !isRunning || isPaused || useRealStream) return;
 
     const canvas = canvasRef.current;
     const ctx = canvas.getContext("2d");
@@ -193,7 +292,7 @@ export function CarlaViewer({
     return () => {
       if (animationRef.current) cancelAnimationFrame(animationRef.current);
     };
-  }, [isRunning, isPaused, scenarioName]);
+  }, [isRunning, isPaused, scenarioName, useRealStream]);
 
   const handlePlayPause = () => {
     if (isPaused) {
@@ -214,13 +313,30 @@ export function CarlaViewer({
     <div className="space-y-4">
       {/* Video Container */}
       <div className="relative bg-black rounded-lg overflow-hidden aspect-video">
-        {/* Canvas for simulated CARLA view */}
-        <canvas
-          ref={canvasRef}
-          width={800}
-          height={450}
-          className="w-full h-full object-cover"
-        />
+        {/* Real CARLA Stream */}
+        {useRealStream && currentFrame ? (
+          <img
+            ref={imgRef}
+            src={currentFrame}
+            alt="CARLA Stream"
+            className="w-full h-full object-cover"
+          />
+        ) : useRealStream && !currentFrame ? (
+          <div className="w-full h-full flex items-center justify-center text-white">
+            <div className="text-center">
+              <div className="animate-spin text-4xl mb-2">⏳</div>
+              <p>Waiting for camera stream...</p>
+            </div>
+          </div>
+        ) : (
+          /* Canvas for simulated CARLA view */
+          <canvas
+            ref={canvasRef}
+            width={800}
+            height={450}
+            className="w-full h-full object-cover"
+          />
+        )}
 
         {/* Overlay - Live Badge */}
         {isRunning && (
@@ -232,6 +348,11 @@ export function CarlaViewer({
               {camera === "bird" ? "🦅" : camera === "chase" ? "🚗" : "👁️"}{" "}
               {CAMERA_OPTIONS.find((c) => c.id === camera)?.label}
             </Badge>
+            {useRealStream && (
+              <Badge variant={streamConnected ? "default" : "secondary"} className="bg-green-600 text-white">
+                {streamConnected ? "📡 Real Stream" : "📡 Connecting..."}
+              </Badge>
+            )}
           </div>
         )}
 
@@ -311,8 +432,24 @@ export function CarlaViewer({
             </div>
 
             <div className="flex items-center gap-2">
+              {/* Real Stream Toggle */}
+              {isConnected && (
+                <Button 
+                  size="sm" 
+                  variant={useRealStream ? "default" : "outline"} 
+                  className={useRealStream ? "bg-green-600 hover:bg-green-700" : "text-white border-white/30"}
+                  onClick={toggleRealStream}
+                >
+                  {useRealStream ? (
+                    <><Video className="h-4 w-4 mr-1" /> Real</>
+                  ) : (
+                    <><VideoOff className="h-4 w-4 mr-1" /> Simulated</>
+                  )}
+                </Button>
+              )}
+
               {/* Camera selector */}
-              <Select value={camera} onValueChange={setCamera}>
+              <Select value={camera} onValueChange={handleCameraChange}>
                 <SelectTrigger className="w-36 h-8 bg-white/10 border-white/20 text-white">
                   <Camera className="h-4 w-4 mr-2" />
                   <SelectValue />
